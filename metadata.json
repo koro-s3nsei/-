@@ -1,0 +1,6 @@
+{
+  "name": "الفيلسوف مبعسس",
+  "description": "نظام إدارة المهام الذكي والتنفيذ التدريجي (Offline-First Task & Focus Engine) — يعمل محلياً عبر IndexedDB وجاهز كـ PWA و APK عبر CapacitorJS.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
