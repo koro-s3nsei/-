@@ -148,10 +148,10 @@ CREATE POLICY "micro_steps_all_own" ON public.micro_steps FOR ALL USING (auth.ui
 CREATE POLICY "commitments_all_own" ON public.fixed_commitments FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 CREATE POLICY "alarm_sessions_all_own" ON public.alarm_sessions FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`;
 
-export const ANDROID_MANIFEST_SNIPPET = `<!-- أضف هذه الصلاحيات داخل android/app/src/main/AndroidManifest.xml بعد npx cap add android -->
-<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-<uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
-<uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-<uses-permission android:name="android.permission.WAKE_LOCK" />
+export const ANDROID_MANIFEST_SNIPPET = `<!-- تُحقن هذه الصلاحيات تلقائياً في android/app/src/main/AndroidManifest.xml عبر scripts/patch-android-manifest.mjs -->
 <uses-permission android:name="android.permission.RECORD_AUDIO" />
-<uses-permission android:name="android.permission.VIBRATE" />`;
+<uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+<uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+<uses-permission android:name="android.permission.VIBRATE" />
+<uses-permission android:name="android.permission.WAKE_LOCK" />`;

@@ -2,6 +2,7 @@ import React, { useMemo, useRef, useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import {
   AlertCircle,
+  BookOpen,
   Check,
   ChevronDown,
   ChevronUp,
@@ -13,6 +14,7 @@ import {
   Mic,
   MicOff,
   Plus,
+  Save,
   Sparkles,
   Trash2,
   Wand2,
@@ -36,6 +38,8 @@ import type {
   ProjectRecord,
   TaskRecord,
 } from '../../types/models';
+import { OriginalTextModal } from '../notes/OriginalTextModal';
+import { ErrorActionBanner } from '../ui/ErrorActionBanner';
 import { Button, Input, Surface, Textarea } from '../ui/primitives';
 
 interface CaptureViewProps {
@@ -56,9 +60,12 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
     null
   );
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
-  const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [errorState, setErrorState] = useState<{
+    message: string;
+    fixLabel?: string;
+    onFix?: () => void;
+  } | null>(null);
 
-  // Active refined draft state
   const [activeCaptureId, setActiveCaptureId] = useState<string | null>(null);
   const [actionPoints, setActionPoints] = useState<string[]>([]);
   const [logicalErrors, setLogicalErrors] = useState<LogicalErrorSpan[]>([]);
@@ -68,6 +75,7 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
   const [showExtraIdeas, setShowExtraIdeas] = useState(false);
   const [newManualPoint, setNewManualPoint] = useState('');
   const [selectedHorizon, setSelectedHorizon] = useState<ProjectHorizon>('week');
+  const [viewingNoteId, setViewingNoteId] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -77,10 +85,10 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
   );
 
   const {
-    isSupported: isSpeechSupported,
     isListening,
     interimText,
     error: speechError,
+    clearError: clearSpeechError,
     startListening,
     stopListening,
   } = useSpeechRecognition((transcriptChunk) => {
@@ -91,7 +99,7 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    setErrorBanner(null);
+    setErrorState(null);
     setStatusNotice(null);
 
     const detectedSource: CaptureSourceType = file.type.startsWith('image/')
@@ -104,27 +112,99 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
         setOcrProgress(update);
       });
       if (!extracted) {
-        setErrorBanner('لم يتم العثور على نص واضح داخل الملف. جرب صورة أوضح أو أضف النص يدوياً.');
+        setErrorState({
+          message: 'لم يُعثر على نص واضح داخل الملف.',
+          fixLabel: 'تطبيق الإصلاح',
+          onFix: () => {
+            setErrorState(null);
+            fileInputRef.current?.click();
+          },
+        });
       } else {
         setRawInput((prev) => (prev.trim() ? `${prev.trim()}\n\n${extracted}` : extracted));
-        setStatusNotice(`تم استخراج النص محلياً من «${file.name}» بدون استهلاك أي حصة API.`);
+        setStatusNotice(`تم استخراج النص من «${file.name}».`);
       }
     } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : 'فشل استخراج النص محلياً من الملف.');
+      setErrorState({
+        message: err instanceof Error ? err.message : 'تعذر قراءة الملف محلياً.',
+        fixLabel: 'تطبيق الإصلاح',
+        onFix: () => {
+          setErrorState(null);
+          fileInputRef.current?.click();
+        },
+      });
     } finally {
       setTimeout(() => setOcrProgress(null), 900);
       e.target.value = '';
     }
   };
 
-  const handleStrictAnalyze = async () => {
+  // Save verbatim original text as a standalone note (without splitting into tasks) and open its separate window
+  const handleSaveOriginalNoteOnly = async () => {
     const trimmed = rawInput.trim();
     if (!trimmed) {
-      setErrorBanner('أدخل نصاً أو تسجيلاً صوتياً أو ارفع مستنداً أولاً.');
+      setErrorState({
+        message: 'اكتب أو أمْلِ نصاً أولاً لحفظه كما هو.',
+        fixLabel: 'تطبيق الإصلاح',
+        onFix: () => {
+          setErrorState(null);
+          setRawInput(SAMPLE_RAW_INPUT);
+        },
+      });
       return;
     }
 
-    setErrorBanner(null);
+    setErrorState(null);
+    const now = new Date().toISOString();
+    const captureId = activeCaptureId ?? generateId();
+    const existing = activeCaptureId ? await db.captures.get(activeCaptureId) : undefined;
+
+    const record: CaptureRecord = {
+      id: captureId,
+      sourceType,
+      rawInput: trimmed,
+      actionPoints,
+      logicalErrors,
+      extraIdeas,
+      processingEngine,
+      convertedProjectId: existing?.convertedProjectId,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+
+    try {
+      await db.captures.put(record);
+      await enqueueSyncChange('captures', captureId, 'upsert', record);
+      setActiveCaptureId(captureId);
+      setStatusNotice('تم حفظ النص الأصلي كما هو دون تقسيم.');
+      setViewingNoteId(captureId);
+    } catch (err) {
+      setErrorState({
+        message: err instanceof Error ? err.message : 'تعذر حفظ النص الأصلي محلياً.',
+        fixLabel: 'تطبيق الإصلاح',
+        onFix: () => {
+          setErrorState(null);
+          void handleSaveOriginalNoteOnly();
+        },
+      });
+    }
+  };
+
+  const handleStrictAnalyze = async () => {
+    const trimmed = rawInput.trim();
+    if (!trimmed) {
+      setErrorState({
+        message: 'أدخل نصاً أو تسجيلاً صوتياً أولاً.',
+        fixLabel: 'تطبيق الإصلاح',
+        onFix: () => {
+          setErrorState(null);
+          setRawInput(SAMPLE_RAW_INPUT);
+        },
+      });
+      return;
+    }
+
+    setErrorState(null);
     setStatusNotice(null);
     setIsAnalyzing(true);
     setOpenErrorId(null);
@@ -160,16 +240,52 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
         setStatusNotice(usedFallbackNotice);
       }
     } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : 'حدث خطأ أثناء التنقيح.');
+      setErrorState({
+        message: err instanceof Error ? err.message : 'حدث خطأ أثناء التنقيح.',
+        fixLabel: 'تطبيق الإصلاح',
+        onFix: () => {
+          setErrorState(null);
+          void handleStrictAnalyze();
+        },
+      });
     } finally {
       setIsAnalyzing(false);
     }
   };
 
+  const syncCaptureEdits = async (
+    nextText: string,
+    nextErrors: LogicalErrorSpan[],
+    nextIdeas = extraIdeas
+  ) => {
+    if (!activeCaptureId) return;
+    const existing = await db.captures.get(activeCaptureId);
+    if (!existing) return;
+    const updated: CaptureRecord = {
+      ...existing,
+      rawInput: nextText,
+      logicalErrors: nextErrors,
+      extraIdeas: nextIdeas,
+      updatedAt: new Date().toISOString(),
+    };
+    await db.captures.put(updated);
+    await enqueueSyncChange('captures', activeCaptureId, 'upsert', updated);
+  };
+
   const handleApplyErrorFix = (errItem: LogicalErrorSpan) => {
-    setRawInput((prev) => prev.replace(errItem.originalSegment, errItem.suggestedFix));
-    setLogicalErrors((prev) => prev.filter((item) => item.id !== errItem.id));
+    const nextText = rawInput.replace(errItem.originalSegment, errItem.suggestedFix);
+    const nextErrors = logicalErrors.filter((item) => item.id !== errItem.id);
+    setRawInput(nextText);
+    setLogicalErrors(nextErrors);
     setOpenErrorId(null);
+    void syncCaptureEdits(nextText, nextErrors);
+  };
+
+  const handleIgnoreLogicalError = (errId: string) => {
+    const nextErrors = logicalErrors.filter((item) => item.id !== errId);
+    setLogicalErrors(nextErrors);
+    setOpenErrorId(null);
+    void syncCaptureEdits(rawInput, nextErrors);
   };
 
   const handleAddManualPoint = () => {
@@ -188,17 +304,46 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
   const handleApproveAndScheduleProject = async () => {
     const validPoints = actionPoints.map((p) => p.trim()).filter(Boolean);
     if (validPoints.length === 0) {
-      setErrorBanner('أضف نقطة تنفيذية واحدة على الأقل قبل اعتماد المشروع.');
+      setErrorState({
+        message: 'أضف نقطة تنفيذية واحدة على الأقل قبل الاعتماد.',
+        fixLabel: 'تطبيق الإصلاح',
+        onFix: () => {
+          setErrorState(null);
+          if (rawInput.trim()) {
+            void handleStrictAnalyze();
+          }
+        },
+      });
       return;
     }
 
     setIsApproving(true);
-    setErrorBanner(null);
+    setErrorState(null);
 
     try {
       const { result } = await decomposeProjectPrecomputed(validPoints, rawInput);
       const now = new Date().toISOString();
       const projectId = generateId();
+
+      // Always keep the verbatim original text saved alongside the created project
+      let linkedCaptureId = activeCaptureId;
+      if (!linkedCaptureId && rawInput.trim()) {
+        linkedCaptureId = generateId();
+        const fallbackCapture: CaptureRecord = {
+          id: linkedCaptureId,
+          sourceType,
+          rawInput: rawInput.trim(),
+          actionPoints: validPoints,
+          logicalErrors,
+          extraIdeas,
+          processingEngine,
+          convertedProjectId: projectId,
+          createdAt: now,
+          updatedAt: now,
+        };
+        await db.captures.put(fallbackCapture);
+        await enqueueSyncChange('captures', linkedCaptureId, 'upsert', fallbackCapture);
+      }
 
       const tasksToSave: TaskRecord[] = [];
       const rawMicroSteps: MicroStepRecord[] = [];
@@ -226,7 +371,7 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
             parts:
               stepDraft.parts.length > 0
                 ? stepDraft.parts
-                : [`ابدأ فوراً بتنفيذ: ${stepDraft.title}`],
+                : [`ابدأ بتنفيذ: ${stepDraft.title}`],
             currentPartIndex: 0,
             orderIndex: globalOrder++,
             durationMinutes: stepDraft.durationMinutes,
@@ -254,7 +399,7 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
 
       const newProject: ProjectRecord = {
         id: projectId,
-        sourceCaptureId: activeCaptureId ?? undefined,
+        sourceCaptureId: linkedCaptureId ?? undefined,
         title: result.projectTitle,
         objective: result.objective,
         horizon: selectedHorizon,
@@ -273,8 +418,11 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
           await db.projects.add(newProject);
           await db.tasks.bulkAdd(tasksToSave);
           await db.microSteps.bulkAdd(scheduledSteps);
-          if (activeCaptureId) {
-            await db.captures.update(activeCaptureId, {
+          if (linkedCaptureId) {
+            await db.captures.update(linkedCaptureId, {
+              rawInput: rawInput.trim() || validPoints.join('\n'),
+              logicalErrors,
+              extraIdeas,
               convertedProjectId: projectId,
               updatedAt: now,
             });
@@ -285,15 +433,19 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
       await enqueueSyncChange('projects', projectId, 'upsert', newProject);
       onProjectCreated(projectId);
     } catch (err) {
-      setErrorBanner(
-        err instanceof Error ? err.message : 'تعذر اعتماد المشروع وتقسيم خطواته في IndexedDB.'
-      );
+      setErrorState({
+        message: err instanceof Error ? err.message : 'تعذر اعتماد المشروع محلياً.',
+        fixLabel: 'تطبيق الإصلاح',
+        onFix: () => {
+          setErrorState(null);
+          void handleApproveAndScheduleProject();
+        },
+      });
     } finally {
       setIsApproving(false);
     }
   };
 
-  // Highlight logical errors inline inside the original raw text with toggleable icon button
   const annotatedSegments = useMemo(() => {
     if (!rawInput.trim() || logicalErrors.length === 0) return null;
 
@@ -314,7 +466,6 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
     if (spans.length === 0) return null;
     spans.sort((a, b) => a.start - b.start);
 
-    // Filter overlapping spans
     const cleanSpans: MatchSpan[] = [];
     let lastEnd = 0;
     for (const sp of spans) {
@@ -353,28 +504,34 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
   };
 
   return (
-    <div className="mx-auto max-w-6xl space-y-6">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">وحدة الاستيعاب والتنقيح الصارم</h1>
-          <p className="mt-1 text-sm text-[#64748B] dark:text-[#94A3B8]">
-            أدخل أفكارك نصاً أو صوتاً أو عبر صورة ومستند؛ يُحوّلها المحرك مباشرةً لنقاط تنفيذية حادة
-            ويكشف الأخطاء المنطقية قبل التقسيم المسبق.
-          </p>
-        </div>
+    <div className="mx-auto max-w-5xl space-y-6">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">الاستيعاب والتنقيح</h1>
 
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
-            setRawInput(SAMPLE_RAW_INPUT);
-            setSourceType('text');
-            setErrorBanner(null);
-          }}
-        >
-          <Wand2 className="h-4 w-4" strokeWidth={1.75} />
-          <span>تعبئة مثال تجريبي</span>
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          {activeCaptureId && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setViewingNoteId(activeCaptureId)}
+            >
+              <BookOpen className="h-4 w-4" strokeWidth={1.75} />
+              <span>نافذة النص الأصلي</span>
+            </Button>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setRawInput(SAMPLE_RAW_INPUT);
+              setSourceType('text');
+              setErrorState(null);
+            }}
+          >
+            <Wand2 className="h-4 w-4" strokeWidth={1.75} />
+            <span>مثال تجريبي</span>
+          </Button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
@@ -382,19 +539,15 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
         <div className="space-y-4 lg:col-span-7">
           <Surface className="p-5">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2 text-xs text-[#64748B] dark:text-[#94A3B8]">
-                <span>المصدر</span>
-                <span aria-hidden="true">·</span>
-                <span className="font-medium text-[#0F172A] dark:text-[#F3F5F8]">
-                  {sourceType === 'text'
-                    ? 'نص حر'
-                    : sourceType === 'voice'
-                      ? 'تسجيل صوتي محلي'
-                      : sourceType === 'image'
-                        ? 'صورة (OCR محلي)'
-                        : 'مستند'}
-                </span>
-              </div>
+              <span className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                {sourceType === 'text'
+                  ? 'نص'
+                  : sourceType === 'voice'
+                    ? 'صوت'
+                    : sourceType === 'image'
+                      ? 'صورة'
+                      : 'مستند'}
+              </span>
 
               <div className="flex items-center gap-2">
                 <input
@@ -408,20 +561,20 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                 <Button
                   variant={isListening ? 'destructive' : 'secondary'}
                   size="sm"
-                  onClick={isListening ? stopListening : startListening}
-                  disabled={!isSpeechSupported}
-                  title={
-                    isSpeechSupported
-                      ? 'تسجيل صوتي محلي عبر Web Speech API'
-                      : 'التسجيل الصوتي غير مدعوم في هذا المتصفح'
-                  }
+                  onClick={() => {
+                    if (isListening) {
+                      void stopListening();
+                    } else {
+                      void startListening();
+                    }
+                  }}
                 >
                   {isListening ? (
                     <MicOff className="h-4 w-4" strokeWidth={1.75} />
                   ) : (
                     <Mic className="h-4 w-4" strokeWidth={1.75} />
                   )}
-                  <span>{isListening ? 'إيقاف الصوت' : 'إملاء صوتي'}</span>
+                  <span>{isListening ? 'إيقاف' : 'إملاء صوتي'}</span>
                 </Button>
 
                 <Button
@@ -431,7 +584,7 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                   disabled={Boolean(ocrProgress)}
                 >
                   <ImageIcon className="h-4 w-4" strokeWidth={1.75} />
-                  <span>مسح صورة / مستند</span>
+                  <span>صورة / ملف</span>
                 </Button>
               </div>
             </div>
@@ -440,27 +593,27 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
               rows={7}
               value={rawInput}
               onChange={(e) => setRawInput(e.target.value)}
-              placeholder="اكتب الفكرة أو المهام كما تخطر في بالك بدون ترتيب... أو استخدم الإملاء الصوتي أو مسح المستندات."
+              placeholder="اكتب الفكرة أو المهام..."
               className="resize-y"
             />
 
             {isListening && (
-              <div className="mt-3 flex items-center justify-between rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-600 dark:text-red-400">
-                <span>جاري الاستماع باللغة العربية عبر Web Speech API...</span>
+              <div className="mt-3 flex items-center justify-between rounded-xl border border-red-500/25 bg-red-500/8 px-3.5 py-2.5 text-xs text-red-600 dark:text-red-400">
+                <span>جاري الاستماع...</span>
                 {interimText && <span className="truncate font-medium">{interimText}</span>}
               </div>
             )}
 
             {ocrProgress && (
-              <div className="mt-3 space-y-1.5 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-3 dark:border-[#232936] dark:bg-[#0E1116]">
+              <div className="mt-3 space-y-1.5 rounded-xl border border-[#E5E7EB] bg-[#FAFAFA] p-3 dark:border-[#222630] dark:bg-[#0E1015]">
                 <div className="flex items-center justify-between text-xs">
                   <span className="flex items-center gap-2 font-medium">
                     <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" strokeWidth={1.75} />
                     {ocrProgress.status}
                   </span>
-                  <span className="font-mono-tabular text-[#64748B]">{ocrProgress.progress}%</span>
+                  <span className="font-mono-tabular text-[#6B7280]">{ocrProgress.progress}%</span>
                 </div>
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-[#E2E8F0] dark:bg-[#1E2430]">
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-[#E5E7EB] dark:bg-[#1E222D]">
                   <div
                     className="h-full bg-blue-600 transition-all duration-150"
                     style={{ width: `${ocrProgress.progress}%` }}
@@ -469,18 +622,36 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
               </div>
             )}
 
-            {(speechError || errorBanner) && (
-              <div className="mt-3 flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-600 dark:text-red-400">
-                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" strokeWidth={1.75} />
-                <span>{speechError ?? errorBanner}</span>
+            {speechError && (
+              <div className="mt-3">
+                <ErrorActionBanner
+                  message={speechError}
+                  fixLabel="تطبيق الإصلاح"
+                  onApplyFix={() => {
+                    clearSpeechError();
+                    void startListening();
+                  }}
+                  onIgnore={clearSpeechError}
+                />
               </div>
             )}
 
-            {statusNotice && !errorBanner && (
-              <div className="mt-3 text-xs text-[#64748B] dark:text-[#94A3B8]">{statusNotice}</div>
+            {errorState && (
+              <div className="mt-3">
+                <ErrorActionBanner
+                  message={errorState.message}
+                  fixLabel={errorState.fixLabel ?? 'تطبيق الإصلاح'}
+                  onApplyFix={errorState.onFix}
+                  onIgnore={() => setErrorState(null)}
+                />
+              </div>
             )}
 
-            <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-[#E2E8F0] pt-4 dark:border-[#232936]">
+            {statusNotice && !errorState && (
+              <p className="mt-3 text-xs text-[#6B7280] dark:text-[#9CA3AF]">{statusNotice}</p>
+            )}
+
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-[#E5E7EB] pt-4 dark:border-[#222630]">
               <Button
                 variant="ghost"
                 size="sm"
@@ -491,46 +662,68 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                   setExtraIdeas([]);
                   setActiveCaptureId(null);
                   setStatusNotice(null);
-                  setErrorBanner(null);
+                  setErrorState(null);
                 }}
                 disabled={!rawInput && actionPoints.length === 0}
               >
                 <X className="h-4 w-4" strokeWidth={1.75} />
-                <span>تفريغ</span>
+                <span>مسح</span>
               </Button>
 
-              <Button
-                variant="primary"
-                onClick={handleStrictAnalyze}
-                disabled={isAnalyzing || !rawInput.trim()}
-              >
-                {isAnalyzing ? (
-                  <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.75} />
-                ) : (
-                  <Sparkles className="h-4 w-4" strokeWidth={1.75} />
-                )}
-                <span>{isAnalyzing ? 'جاري التنقيح الصارم...' : 'تنقيح صارم وكشف الأخطاء'}</span>
-              </Button>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleSaveOriginalNoteOnly()}
+                  disabled={!rawInput.trim()}
+                  title="حفظ ما كتبته نصاً في نافذة مستقلة دون تقسيمه لمهام"
+                >
+                  <Save className="h-4 w-4" strokeWidth={1.75} />
+                  <span>حفظ النص كما هو</span>
+                </Button>
+
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => void handleStrictAnalyze()}
+                  disabled={isAnalyzing || !rawInput.trim()}
+                >
+                  {isAnalyzing ? (
+                    <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.75} />
+                  ) : (
+                    <Sparkles className="h-4 w-4" strokeWidth={1.75} />
+                  )}
+                  <span>{isAnalyzing ? 'جاري التنقيح...' : 'تنقيح وكشف الأخطاء'}</span>
+                </Button>
+              </div>
             </div>
           </Surface>
 
-          {/* Annotated Logical Errors View */}
+          {/* Annotated Logical Errors View (Non-blocking with Two Clear Choices) */}
           {logicalErrors.length > 0 && (
             <Surface className="p-5">
-              <div className="flex items-center justify-between gap-2 border-b border-[#E2E8F0] pb-3 dark:border-[#232936]">
+              <div className="flex items-center justify-between gap-2 border-b border-[#E5E7EB] pb-3 dark:border-[#222630]">
                 <div className="flex items-center gap-2">
                   <AlertCircle className="h-4 w-4 text-red-500" strokeWidth={1.75} />
                   <h2 className="text-sm font-semibold">
-                    كشف الأخطاء المنطقية والتقنية ({logicalErrors.length})
+                    ملاحظات منطقية اختيارية ({logicalErrors.length})
                   </h2>
                 </div>
-                <span className="text-xs text-[#64748B] dark:text-[#94A3B8]">
-                  انقر أيقونة الخطأ لعرض التفسير وإخفائه
-                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setLogicalErrors([]);
+                    setOpenErrorId(null);
+                    void syncCaptureEdits(rawInput, []);
+                  }}
+                >
+                  <span>تجاهل الكل</span>
+                </Button>
               </div>
 
               {annotatedSegments ? (
-                <div className="mt-4 text-sm leading-8 text-[#0F172A] dark:text-[#E2E8F0]">
+                <div className="mt-4 text-sm leading-8 text-[#111318] dark:text-[#E5E7EB]">
                   {annotatedSegments.map((seg, idx) => {
                     if (seg.type === 'text') {
                       return (
@@ -542,15 +735,15 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                     const isOpen = openErrorId === seg.error.id;
                     return (
                       <span key={seg.error.id} className="inline">
-                        <span className="rounded bg-red-500/15 border-b-2 border-red-500 px-1 py-0.5 text-[#0F172A] dark:text-[#F8FAFC]">
+                        <span className="rounded border-b-2 border-red-500 bg-red-500/12 px-1 py-0.5 text-[#111318] dark:text-[#F4F5F7]">
                           {seg.error.originalSegment}
                         </span>
                         <button
                           type="button"
                           onClick={() => setOpenErrorId(isOpen ? null : seg.error.id)}
                           aria-expanded={isOpen}
-                          aria-label="عرض أو إخفاء تفسير الخطأ المنطقي"
-                          className="mx-1 inline-flex h-6 w-6 items-center justify-center rounded-md bg-red-500/15 text-red-600 hover:bg-red-500/25 dark:text-red-400 align-middle cursor-pointer"
+                          aria-label="عرض أو إخفاء الملاحظة"
+                          className="mx-1 inline-flex h-6 w-6 cursor-pointer items-center justify-center rounded-md bg-red-500/12 align-middle text-red-600 hover:bg-red-500/20 dark:text-red-400"
                         >
                           <AlertCircle className="h-3.5 w-3.5" strokeWidth={1.75} />
                         </button>
@@ -564,14 +757,14 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                     const isOpen = openErrorId === err.id;
                     return (
                       <div key={err.id} className="flex items-center gap-2 text-sm">
-                        <span className="rounded bg-red-500/15 border-b-2 border-red-500 px-1.5 py-0.5">
+                        <span className="rounded border-b-2 border-red-500 bg-red-500/12 px-1.5 py-0.5">
                           {err.originalSegment}
                         </span>
                         <button
                           type="button"
                           onClick={() => setOpenErrorId(isOpen ? null : err.id)}
-                          aria-label="تفسير الخطأ"
-                          className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-red-500/15 text-red-600 hover:bg-red-500/25 dark:text-red-400 cursor-pointer"
+                          aria-label="عرض الملاحظة"
+                          className="inline-flex h-7 w-7 cursor-pointer items-center justify-center rounded-md bg-red-500/12 text-red-600 hover:bg-red-500/20 dark:text-red-400"
                         >
                           <AlertCircle className="h-4 w-4" strokeWidth={1.75} />
                         </button>
@@ -581,39 +774,46 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                 </div>
               )}
 
-              {/* Compact toggled explanation box for selected error */}
               {openErrorId &&
                 (() => {
                   const activeErr = logicalErrors.find((e) => e.id === openErrorId);
                   if (!activeErr) return null;
                   return (
-                    <div className="mt-4 rounded-xl border border-red-500/30 bg-red-500/5 p-3.5 text-xs">
+                    <div className="mt-4 rounded-xl border border-red-500/25 bg-red-500/5 p-3.5 text-xs">
                       <div className="flex items-start justify-between gap-3">
                         <div className="space-y-1.5">
                           <p className="font-semibold text-red-600 dark:text-red-400">
-                            الخطأ: {activeErr.reason}
+                            {activeErr.reason}
                           </p>
-                          <p className="text-[#475569] dark:text-[#CBD5E1]">
-                            التصحيح المقترح: {activeErr.suggestedFix}
+                          <p className="text-[#4B5563] dark:text-[#D1D5DB]">
+                            المقترح: {activeErr.suggestedFix}
                           </p>
                         </div>
                         <button
                           type="button"
                           onClick={() => setOpenErrorId(null)}
-                          aria-label="إخفاء التفسير"
-                          className="rounded-lg p-1 text-[#64748B] hover:bg-red-500/10"
+                          aria-label="إغلاق"
+                          className="cursor-pointer rounded-lg p-1 text-[#6B7280] hover:bg-red-500/10"
                         >
                           <X className="h-4 w-4" strokeWidth={1.75} />
                         </button>
                       </div>
-                      <div className="mt-3 flex justify-end">
+                      <div className="mt-3 flex flex-wrap justify-end gap-2">
                         <Button
-                          variant="outline"
+                          variant="primary"
                           size="sm"
                           onClick={() => handleApplyErrorFix(activeErr)}
                         >
                           <Check className="h-3.5 w-3.5" strokeWidth={1.75} />
-                          <span>تطبيق التصحيح</span>
+                          <span>تطبيق الإصلاح</span>
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => handleIgnoreLogicalError(activeErr.id)}
+                        >
+                          <X className="h-3.5 w-3.5" strokeWidth={1.75} />
+                          <span>تجاهل والاستمرار كما هو</span>
                         </Button>
                       </div>
                     </div>
@@ -623,13 +823,13 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
           )}
         </div>
 
-        {/* Strict Action Points & Pre-computation Approval Panel */}
+        {/* Action Points & Approval Panel */}
         <div className="space-y-4 lg:col-span-5">
           <Surface className="p-5">
-            <div className="flex items-center justify-between gap-2 border-b border-[#E2E8F0] pb-3 dark:border-[#232936]">
-              <h2 className="text-sm font-semibold">النقاط التنفيذية المباشرة</h2>
-              <span className="font-mono-tabular text-xs text-[#64748B] dark:text-[#94A3B8]">
-                {actionPoints.length} نقطة ·{' '}
+            <div className="flex items-center justify-between gap-2 border-b border-[#E5E7EB] pb-3 dark:border-[#222630]">
+              <h2 className="text-sm font-semibold">النقاط التنفيذية</h2>
+              <span className="font-mono-tabular text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                {actionPoints.length} ·{' '}
                 {processingEngine === 'offline-local' ? 'محلي' : processingEngine}
               </span>
             </div>
@@ -637,20 +837,19 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
             {actionPoints.length === 0 ? (
               <div className="py-10 text-center">
                 <FileText
-                  className="mx-auto h-8 w-8 text-[#94A3B8] dark:text-[#475569]"
+                  className="mx-auto h-7 w-7 text-[#9CA3AF] dark:text-[#4B5563]"
                   strokeWidth={1.75}
                 />
-                <p className="mt-3 text-sm font-medium">لا توجد نقاط تنفيذية بعد</p>
-                <p className="mt-1 text-xs text-[#64748B] dark:text-[#94A3B8]">
-                  اضغط «تنقيح صارم» أو أضف النقاط يدوياً في الوضع المحلي أدناه.
+                <p className="mt-2.5 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                  أضف نقاطاً يدوياً أو اضغط «تنقيح».
                 </p>
               </div>
             ) : (
-              <ol className="mt-4 space-y-2.5">
+              <ol className="mt-4 space-y-2">
                 {actionPoints.map((point, index) => (
                   <li
                     key={`${index}-${point.slice(0, 12)}`}
-                    className="flex items-start gap-2.5 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-3 dark:border-[#232936] dark:bg-[#0E1116]"
+                    className="flex items-start gap-2.5 rounded-xl border border-[#E5E7EB] bg-[#FAFAFA] p-3 dark:border-[#222630] dark:bg-[#0E1015]"
                   >
                     <span className="font-mono-tabular mt-0.5 text-xs font-semibold text-blue-600 dark:text-blue-400">
                       {String(index + 1).padStart(2, '0')}
@@ -663,7 +862,7 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                         updated[index] = e.target.value;
                         setActionPoints(updated);
                       }}
-                      className="flex-1 bg-transparent text-sm text-[#0F172A] focus:outline-none dark:text-[#F3F5F8]"
+                      className="flex-1 bg-transparent text-sm text-[#111318] focus:outline-none dark:text-[#F4F5F7]"
                     />
                     <button
                       type="button"
@@ -671,7 +870,7 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                         setActionPoints((prev) => prev.filter((_, idx) => idx !== index))
                       }
                       aria-label="حذف النقطة"
-                      className="text-[#94A3B8] hover:text-red-500 cursor-pointer"
+                      className="cursor-pointer text-[#9CA3AF] hover:text-red-500"
                     >
                       <Trash2 className="h-4 w-4" strokeWidth={1.75} />
                     </button>
@@ -680,7 +879,6 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
               </ol>
             )}
 
-            {/* Offline Manual Point Addition */}
             <div className="mt-4 flex gap-2">
               <Input
                 value={newManualPoint}
@@ -691,16 +889,20 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                     handleAddManualPoint();
                   }
                 }}
-                placeholder="إضافة نقطة تنفيذية يدوياً (وضع محلي)..."
+                placeholder="إضافة نقطة..."
               />
-              <Button variant="secondary" size="icon" onClick={handleAddManualPoint} aria-label="إضافة">
+              <Button
+                variant="secondary"
+                size="icon"
+                onClick={handleAddManualPoint}
+                aria-label="إضافة"
+              >
                 <Plus className="h-4 w-4" strokeWidth={1.75} />
               </Button>
             </div>
 
-            {/* Collapsed "أفكار إضافية" Independent Button */}
             {extraIdeas.length > 0 && (
-              <div className="mt-4 border-t border-[#E2E8F0] pt-4 dark:border-[#232936]">
+              <div className="mt-4 border-t border-[#E5E7EB] pt-4 dark:border-[#222630]">
                 <Button
                   variant="outline"
                   size="sm"
@@ -724,13 +926,13 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                     {extraIdeas.map((idea, idx) => (
                       <li
                         key={idx}
-                        className="flex items-center justify-between gap-2 rounded-xl border border-[#E2E8F0] px-3 py-2 text-xs text-[#475569] dark:border-[#232936] dark:text-[#CBD5E1]"
+                        className="flex items-center justify-between gap-2 rounded-xl border border-[#E5E7EB] px-3 py-2 text-xs text-[#4B5563] dark:border-[#222630] dark:text-[#D1D5DB]"
                       >
                         <span>{idea}</span>
                         <button
                           type="button"
                           onClick={() => handleAddIdeaAsPoint(idea)}
-                          className="shrink-0 rounded-lg px-2 py-1 text-blue-600 hover:bg-blue-500/10 dark:text-blue-400 cursor-pointer"
+                          className="shrink-0 cursor-pointer rounded-lg px-2 py-1 text-blue-600 hover:bg-blue-500/10 dark:text-blue-400"
                         >
                           إضافة
                         </button>
@@ -741,22 +943,21 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
               </div>
             )}
 
-            {/* Horizon + Approve & Pre-compute */}
-            <div className="mt-5 space-y-3 border-t border-[#E2E8F0] pt-4 dark:border-[#232936]">
+            <div className="mt-5 space-y-3 border-t border-[#E5E7EB] pt-4 dark:border-[#222630]">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-medium text-[#64748B] dark:text-[#94A3B8]">
-                  أفق توزيع الخطوات المسبقة
+                <span className="text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                  أفق الجدولة
                 </span>
-                <div className="flex items-center gap-1 rounded-xl bg-[#EEF1F6] p-1 dark:bg-[#0E1116]">
+                <div className="flex items-center gap-1 rounded-xl bg-[#F3F4F6] p-1 dark:bg-[#0E1015]">
                   {(['day', 'week', 'month', 'year'] as ProjectHorizon[]).map((h) => (
                     <button
                       key={h}
                       type="button"
                       onClick={() => setSelectedHorizon(h)}
-                      className={`rounded-lg px-2.5 py-1 text-xs font-medium transition-colors cursor-pointer ${
+                      className={`cursor-pointer rounded-lg px-2.5 py-1 text-xs font-medium transition-colors ${
                         selectedHorizon === h
-                          ? 'bg-white text-[#0F172A] shadow-sm dark:bg-[#1E2430] dark:text-[#F3F5F8]'
-                          : 'text-[#64748B] hover:text-[#0F172A] dark:text-[#94A3B8] dark:hover:text-[#F3F5F8]'
+                          ? 'bg-white text-[#111318] shadow-sm dark:bg-[#1E222D] dark:text-[#F4F5F7]'
+                          : 'text-[#6B7280] hover:text-[#111318] dark:text-[#9CA3AF] dark:hover:text-[#F4F5F7]'
                       }`}
                     >
                       {HORIZON_LABELS[h]}
@@ -769,7 +970,7 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                 variant="primary"
                 size="lg"
                 className="w-full"
-                onClick={handleApproveAndScheduleProject}
+                onClick={() => void handleApproveAndScheduleProject()}
                 disabled={isApproving || actionPoints.length === 0}
               >
                 {isApproving ? (
@@ -777,42 +978,54 @@ export const CaptureView: React.FC<CaptureViewProps> = ({ onProjectCreated }) =>
                 ) : (
                   <FolderPlus className="h-4 w-4" strokeWidth={1.75} />
                 )}
-                <span>
-                  {isApproving
-                    ? 'جاري التقسيم المسبق وحفظ IndexedDB...'
-                    : 'اعتماد وتقسيم المشروع تلقائياً'}
-                </span>
+                <span>{isApproving ? 'جاري التقسيم...' : 'اعتماد المشروع'}</span>
               </Button>
             </div>
           </Surface>
 
-          {/* Local Captures History */}
+          {/* Saved Verbatim Original Captures */}
           {recentCaptures && recentCaptures.length > 0 && (
             <Surface className="p-5">
-              <h3 className="text-xs font-semibold text-[#64748B] dark:text-[#94A3B8]">
-                مسودات الاستيعاب المحفوظة محلياً
+              <h3 className="text-xs font-semibold text-[#6B7280] dark:text-[#9CA3AF]">
+                النصوص الأصلية المحفوظة
               </h3>
-              <div className="mt-3 divide-y divide-[#E2E8F0] dark:divide-[#232936]">
+              <div className="mt-3 divide-y divide-[#E5E7EB] dark:divide-[#222630]">
                 {recentCaptures.map((cap) => (
-                  <button
+                  <div
                     key={cap.id}
-                    type="button"
-                    onClick={() => loadPreviousCapture(cap)}
-                    className="flex w-full items-center justify-between gap-3 py-2.5 text-right text-xs transition-colors hover:text-blue-600 dark:hover:text-blue-400 cursor-pointer"
+                    className="flex items-center justify-between gap-2 py-2.5 text-xs"
                   >
-                    <span className="truncate font-medium">
-                      {cap.actionPoints[0] ?? cap.rawInput.slice(0, 48)}
-                    </span>
-                    <span className="font-mono-tabular shrink-0 text-[#64748B] dark:text-[#94A3B8]">
-                      {cap.actionPoints.length} نقاط
-                    </span>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => loadPreviousCapture(cap)}
+                      className="min-w-0 flex-1 cursor-pointer truncate text-right font-medium transition-colors hover:text-blue-600 dark:hover:text-blue-400"
+                    >
+                      {cap.rawInput.split('\n')[0]?.slice(0, 56) || cap.actionPoints[0]}
+                    </button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setViewingNoteId(cap.id)}
+                      title="فتح النص الأصلي في نافذة مستقلة"
+                    >
+                      <BookOpen className="h-3.5 w-3.5" strokeWidth={1.75} />
+                      <span>فتح</span>
+                    </Button>
+                  </div>
                 ))}
               </div>
             </Surface>
           )}
         </div>
       </div>
+
+      {/* Standalone Verbatim Original Text Modal */}
+      {viewingNoteId && (
+        <OriginalTextModal
+          captureId={viewingNoteId}
+          onClose={() => setViewingNoteId(null)}
+        />
+      )}
     </div>
   );
 };

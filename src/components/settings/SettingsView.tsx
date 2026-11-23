@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import {
-  AlertTriangle,
   BellRing,
   Check,
   ChevronDown,
@@ -17,6 +16,7 @@ import {
   Loader2,
   LogIn,
   LogOut,
+  Mic,
   Moon,
   RefreshCw,
   ShieldCheck,
@@ -35,10 +35,12 @@ import {
 import { ANDROID_MANIFEST_SNIPPET, SUPABASE_SCHEMA_SQL } from '../../db/supabaseSchema';
 import { encryptLocalSecret } from '../../lib/cryptoVault';
 import {
+  checkPermissionsStatus,
+  fireImmediateTestNotification,
   getRuntimeEnvironmentLabel,
   isNativeCapacitorPlatform,
-  requestAndroidOverlayPermission,
-  requestAndroidUsageStatsPermission,
+  requestAlarmNotificationPermission,
+  requestMicrophonePermission,
 } from '../../native/capacitorBridge';
 import { DEFAULT_GEMINI_MODEL_ID, testGeminiConnection } from '../../services/geminiClient';
 import {
@@ -50,6 +52,7 @@ import {
 } from '../../services/supabaseSyncService';
 import type { EmergencyChallengeType, ThemeMode } from '../../types/models';
 import { PWAInstallButton } from '../pwa/PWAInstallButton';
+import { ErrorActionBanner } from '../ui/ErrorActionBanner';
 import { Button, Input, Surface } from '../ui/primitives';
 
 interface SettingsViewProps {
@@ -76,7 +79,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   );
   const [showKey, setShowKey] = useState(false);
   const [isTestingKey, setIsTestingKey] = useState(false);
-  const [keyStatusMsg, setKeyStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [keySuccessMsg, setKeySuccessMsg] = useState<string | null>(null);
+  const [keyErrorMsg, setKeyErrorMsg] = useState<string | null>(null);
 
   // Supabase connection + Auth + Sync state
   const [supabaseUrl, setSupabaseUrl] = useState(settings.supabaseUrl ?? '');
@@ -86,18 +90,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [loggedInEmail, setLoggedInEmail] = useState<string | null>(null);
   const [isAuthBusy, setIsAuthBusy] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
-  const [syncNotice, setSyncNotice] = useState<{ ok: boolean; text: string } | null>(null);
+  const [syncSuccessMsg, setSyncSuccessMsg] = useState<string | null>(null);
+  const [syncErrorMsg, setSyncErrorMsg] = useState<string | null>(null);
 
-  // Developer Advanced Accordion (closed by default)
+  // Real runtime permissions state (Notifications & Microphone)
+  const [notifGranted, setNotifGranted] = useState(settings.androidOverlayGranted);
+  const [micGranted, setMicGranted] = useState(settings.androidUsageStatsGranted);
+  const [permissionSuccessMsg, setPermissionSuccessMsg] = useState<string | null>(null);
+  const [permissionError, setPermissionError] = useState<{
+    message: string;
+    onFix: () => void;
+  } | null>(null);
+
+  // Developer Tools Accordion (collapsed by default)
   const [devToolsOpen, setDevToolsOpen] = useState(false);
-
-  // Permission wizard & backup feedback
-  const [permissionNotice, setPermissionNotice] = useState<string | null>(null);
   const [copiedTarget, setCopiedTarget] = useState<'sql' | 'manifest' | null>(null);
-  const [backupNotice, setBackupNotice] = useState<string | null>(null);
+
+  // Backup feedback
+  const [backupSuccessMsg, setBackupSuccessMsg] = useState<string | null>(null);
+  const [backupErrorMsg, setBackupErrorMsg] = useState<string | null>(null);
   const importFileRef = useRef<HTMLInputElement | null>(null);
 
-  // Sync draft inputs once IndexedDB settings finish loading
   useEffect(() => {
     if (settings.geminiModelId) {
       setModelIdDraft(settings.geminiModelId);
@@ -113,7 +126,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   }, [settings.supabaseUrl, settings.supabaseAnonKey]);
 
-  // Check active Supabase session whenever saved credentials exist
+  // Query real OS permissions on mount
+  useEffect(() => {
+    let mounted = true;
+    void checkPermissionsStatus().then((status) => {
+      if (!mounted) return;
+      setNotifGranted(status.notificationsGranted);
+      setMicGranted(status.microphoneGranted);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Check active Supabase session
   useEffect(() => {
     let cancelled = false;
     const checkSession = async () => {
@@ -137,11 +163,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleSaveGeminiConfig = async (e: React.FormEvent) => {
     e.preventDefault();
+    setKeyErrorMsg(null);
+    setKeySuccessMsg(null);
+
     const cleanModel = modelIdDraft.trim() || DEFAULT_GEMINI_MODEL_ID;
     const trimmedKey = apiKeyDraft.trim();
 
     if (trimmedKey && trimmedKey.length < 10) {
-      setKeyStatusMsg({ ok: false, text: 'مفتاح API قصير جداً أو غير مكتمل.' });
+      setKeyErrorMsg('مفتاح API غير مكتمل.');
       return;
     }
 
@@ -164,20 +193,24 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     });
 
     setApiKeyDraft('');
-    setKeyStatusMsg({
-      ok: true,
-      text: trimmedKey
-        ? `تم حفظ النموذج (${cleanModel}) وتشفير مفتاح API محلياً (AES-GCM).`
-        : `تم تحديث معرّف النموذج المحلي إلى (${cleanModel}).`,
-    });
+    setKeySuccessMsg(
+      trimmedKey
+        ? `تم حفظ المفتاح المشفر والنموذج (${cleanModel}).`
+        : `تم تحديث النموذج إلى (${cleanModel}).`
+    );
   };
 
   const handleTestApiKey = async () => {
     const cleanModel = modelIdDraft.trim() || settings.geminiModelId || DEFAULT_GEMINI_MODEL_ID;
     setIsTestingKey(true);
-    setKeyStatusMsg(null);
+    setKeySuccessMsg(null);
+    setKeyErrorMsg(null);
     const res = await testGeminiConnection(apiKeyDraft.trim() || undefined, cleanModel);
-    setKeyStatusMsg({ ok: res.ok, text: res.message });
+    if (res.ok) {
+      setKeySuccessMsg(res.message);
+    } else {
+      setKeyErrorMsg(res.message);
+    }
     setIsTestingKey(false);
   };
 
@@ -191,10 +224,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       updatedAt: new Date().toISOString(),
     });
     setApiKeyDraft('');
-    setKeyStatusMsg({
-      ok: true,
-      text: 'تم مسح المفتاح من الجهاز نهائياً. يعمل النظام الآن بالمحرك المحلي الاحتياطي.',
-    });
+    setKeyErrorMsg(null);
+    setKeySuccessMsg('تم مسح المفتاح؛ يعمل التطبيق الآن بالمحرك المحلي.');
   };
 
   const handleThemeSwitch = async (mode: ThemeMode) => {
@@ -222,34 +253,69 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     });
   };
 
-  const handleRequestOverlay = async () => {
-    const res = await requestAndroidOverlayPermission();
-    if (res.isNative) {
-      await db.appSettings.put({
-        ...settings,
-        id: 'singleton',
-        androidOverlayGranted: res.granted,
-        updatedAt: new Date().toISOString(),
+  const handleRequestAlarmPermission = async () => {
+    setPermissionError(null);
+    setPermissionSuccessMsg(null);
+    const res = await requestAlarmNotificationPermission();
+    setNotifGranted(res.granted);
+    await db.appSettings.put({
+      ...settings,
+      id: 'singleton',
+      androidOverlayGranted: res.granted,
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (res.granted) {
+      setPermissionSuccessMsg(res.message);
+    } else {
+      setPermissionError({
+        message: res.message,
+        onFix: () => void handleRequestAlarmPermission(),
       });
     }
-    setPermissionNotice(res.message);
   };
 
-  const handleRequestUsageStats = async () => {
-    const res = await requestAndroidUsageStatsPermission();
-    if (res.isNative) {
-      await db.appSettings.put({
-        ...settings,
-        id: 'singleton',
-        androidUsageStatsGranted: res.granted,
-        updatedAt: new Date().toISOString(),
+  const handleRequestMicPermission = async () => {
+    setPermissionError(null);
+    setPermissionSuccessMsg(null);
+    const res = await requestMicrophonePermission();
+    setMicGranted(res.granted);
+    await db.appSettings.put({
+      ...settings,
+      id: 'singleton',
+      androidUsageStatsGranted: res.granted,
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (res.granted) {
+      setPermissionSuccessMsg(res.message);
+    } else {
+      setPermissionError({
+        message: res.message,
+        onFix: () => void handleRequestMicPermission(),
       });
     }
-    setPermissionNotice(res.message);
+  };
+
+  const handleFireTestNotification = async () => {
+    setPermissionError(null);
+    setPermissionSuccessMsg(null);
+    const ok = await fireImmediateTestNotification();
+    if (ok) {
+      setNotifGranted(true);
+      setPermissionSuccessMsg('تم إرسال إشعار الاختبار بنجاح.');
+    } else {
+      setPermissionError({
+        message: 'تعذر إرسال الإشعار قبل منح إذن الإشعارات.',
+        onFix: () => void handleRequestAlarmPermission(),
+      });
+    }
   };
 
   const handleSaveSupabaseConfig = async (e: React.FormEvent) => {
     e.preventDefault();
+    setSyncErrorMsg(null);
+    setSyncSuccessMsg(null);
     const cleanUrl = supabaseUrl.trim();
     const cleanAnon = supabaseAnonKey.trim();
     await db.appSettings.put({
@@ -259,20 +325,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       supabaseAnonKey: cleanAnon || undefined,
       updatedAt: new Date().toISOString(),
     });
-    setSyncNotice({
-      ok: true,
-      text:
-        cleanUrl && cleanAnon
-          ? 'تم حفظ بيانات مشروع Supabase. يمكنك الآن تسجيل الدخول أو إنشاء حساب أدناه.'
-          : 'تم مسح بيانات ربط Supabase.',
-    });
+    setSyncSuccessMsg(
+      cleanUrl && cleanAnon ? 'تم حفظ بيانات Supabase.' : 'تم مسح بيانات Supabase.'
+    );
   };
 
   const handleSupabaseLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!settings.supabaseUrl || !settings.supabaseAnonKey) return;
     setIsAuthBusy(true);
-    setSyncNotice(null);
+    setSyncSuccessMsg(null);
+    setSyncErrorMsg(null);
     const res = await signInSupabase(
       settings.supabaseUrl,
       settings.supabaseAnonKey,
@@ -280,11 +343,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       authPassword
     );
     if (res.error) {
-      setSyncNotice({ ok: false, text: res.error });
+      setSyncErrorMsg(res.error);
     } else if (res.session?.user?.email) {
       setLoggedInEmail(res.session.user.email);
       setAuthPassword('');
-      setSyncNotice({ ok: true, text: `تم تسجيل الدخول بنجاح (${res.session.user.email}).` });
+      setSyncSuccessMsg(`تم تسجيل الدخول (${res.session.user.email}).`);
     }
     setIsAuthBusy(false);
   };
@@ -292,14 +355,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const handleSupabaseSignUp = async () => {
     if (!settings.supabaseUrl || !settings.supabaseAnonKey) return;
     if (!authEmail.trim() || authPassword.length < 6) {
-      setSyncNotice({
-        ok: false,
-        text: 'أدخل بريداً إلكترونياً صالحاً وكلمة مرور من 6 أحرف على الأقل.',
-      });
+      setSyncErrorMsg('أدخل بريداً صالحاً وكلمة مرور من 6 أحرف فأكثر.');
       return;
     }
     setIsAuthBusy(true);
-    setSyncNotice(null);
+    setSyncSuccessMsg(null);
+    setSyncErrorMsg(null);
     const res = await signUpSupabase(
       settings.supabaseUrl,
       settings.supabaseAnonKey,
@@ -307,13 +368,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       authPassword
     );
     if (res.error) {
-      setSyncNotice({ ok: false, text: res.error });
+      setSyncErrorMsg(res.error);
     } else {
       if (res.session?.user?.email) {
         setLoggedInEmail(res.session.user.email);
         setAuthPassword('');
       }
-      setSyncNotice({ ok: true, text: res.message ?? 'تم إنشاء الحساب.' });
+      setSyncSuccessMsg(res.message ?? 'تم إنشاء الحساب.');
     }
     setIsAuthBusy(false);
   };
@@ -323,25 +384,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setIsAuthBusy(true);
     await signOutSupabase(settings.supabaseUrl, settings.supabaseAnonKey);
     setLoggedInEmail(null);
-    setSyncNotice({ ok: true, text: 'تم تسجيل الخروج من المزامنة السحابية.' });
+    setSyncErrorMsg(null);
+    setSyncSuccessMsg('تم تسجيل الخروج.');
     setIsAuthBusy(false);
   };
 
   const handleSyncNow = async () => {
     if (!settings.supabaseUrl || !settings.supabaseAnonKey) return;
     setIsSyncing(true);
-    setSyncNotice(null);
+    setSyncSuccessMsg(null);
+    setSyncErrorMsg(null);
     try {
       const summary = await syncWithSupabaseNow(settings.supabaseUrl, settings.supabaseAnonKey);
-      setSyncNotice({
-        ok: true,
-        text: `اكتملت المزامنة بنجاح: رفع ${summary.pushedCount} سجل، سحب ${summary.pulledCount} سجل، حذف ${summary.deletedCount}.`,
-      });
+      setSyncSuccessMsg(
+        `اكتملت المزامنة: رفع ${summary.pushedCount}، سحب ${summary.pulledCount}، حذف ${summary.deletedCount}.`
+      );
     } catch (err) {
-      setSyncNotice({
-        ok: false,
-        text: err instanceof Error ? err.message : 'فشلت المزامنة مع Supabase.',
-      });
+      setSyncErrorMsg(err instanceof Error ? err.message : 'فشلت المزامنة مع Supabase.');
     } finally {
       setIsSyncing(false);
     }
@@ -353,7 +412,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setCopiedTarget(target);
       setTimeout(() => setCopiedTarget(null), 1800);
     } catch {
-      setSyncNotice({ ok: false, text: 'تعذر النسخ التلقائي؛ يمكنك التحديد والنسخ يدوياً.' });
+      setSyncErrorMsg('تعذر النسخ التلقائي.');
     }
   };
 
@@ -374,24 +433,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   const handleExportJson = async () => {
+    setBackupErrorMsg(null);
     const json = await exportDatabaseToJson();
     handleDownloadFile(
       `alfaylasouf-mubasis-backup-${new Date().toISOString().slice(0, 10)}.json`,
       json,
       'application/json;charset=utf-8'
     );
-    setBackupNotice('تم تصدير نسخة احتياطية كاملة من IndexedDB بنجاح.');
+    setBackupSuccessMsg('تم تصدير النسخة الاحتياطية.');
   };
 
   const handleImportJson = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setBackupErrorMsg(null);
+    setBackupSuccessMsg(null);
     try {
       const content = await file.text();
       const res = await importDatabaseFromJson(content);
-      setBackupNotice(`تمت استعادة ${res.projectsCount} مشروع و ${res.stepsCount} خطوة جزئية.`);
+      setBackupSuccessMsg(`تمت استعادة ${res.projectsCount} مشروع و ${res.stepsCount} خطوة.`);
     } catch (err) {
-      setBackupNotice(err instanceof Error ? err.message : 'فشل استيراد الملف.');
+      setBackupErrorMsg(err instanceof Error ? err.message : 'ملف النسخة غير صالح.');
     } finally {
       e.target.value = '';
     }
@@ -401,82 +463,150 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">الإعدادات والمزامنة السحابية</h1>
-        <p className="mt-1 text-sm text-[#64748B] dark:text-[#94A3B8]">
-          إدارة مفتاح Gemini API المباشر، المزامنة مع Supabase بين الكمبيوتر والهاتف، إعدادات
-          المنبه، وصلاحيات نسخة الأندرويد APK.
-        </p>
-      </div>
+      <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">الإعدادات</h1>
 
-      {/* Official Brand Identity Card */}
+      {/* Brand Identity & Quick Actions */}
       <Surface className="overflow-hidden">
         <div className="grid grid-cols-1 md:grid-cols-12">
-          <div className="bg-[#0B0D10] md:col-span-5">
+          <div className="bg-[#0C0D10] md:col-span-4">
             <img
               src="./assets/aistudio/Gemini_Generated_Image_x73ws7x73ws7x73w_dafeee7b.jfif"
-              alt="شعار تطبيق الفيلسوف مبعسس"
+              alt="الفيلسوف مبعسس"
               referrerPolicy="no-referrer"
-              className="h-full min-h-[180px] w-full object-cover"
+              className="h-full min-h-[160px] w-full object-cover"
             />
           </div>
-          <div className="flex flex-col justify-between gap-4 p-5 md:col-span-7">
-            <div className="space-y-1.5">
-              <h2 className="text-lg font-bold">الفيلسوف مبعسس — محرك المهام والتنفيذ التدريجي</h2>
-              <p className="text-xs leading-relaxed text-[#64748B] dark:text-[#94A3B8]">
-                تطبيق Static PWA يعمل محلياً أولاً عبر IndexedDB (Dexie.js) وجاهز للتغليف كـ APK
-                أصلي للأندرويد عبر CapacitorJS بتكلفة تشغيلية صفرية.
-              </p>
-            </div>
-            <div className="flex flex-wrap items-center gap-3 text-xs text-[#64748B] dark:text-[#94A3B8]">
-              <span>البيئة: {getRuntimeEnvironmentLabel()}</span>
-              <span aria-hidden="true">·</span>
-              <span className="font-mono-tabular">{projectsCount} مشاريع</span>
-              <span aria-hidden="true">·</span>
-              <span className="font-mono-tabular">{stepsCount} خطوات مخزنة</span>
+          <div className="flex flex-col justify-between gap-4 p-5 md:col-span-8">
+            <div className="space-y-1">
+              <h2 className="text-base font-semibold">الفيلسوف مبعسس</h2>
+              <div className="flex flex-wrap items-center gap-2 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                <span>{getRuntimeEnvironmentLabel()}</span>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono-tabular">{projectsCount} مشاريع</span>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono-tabular">{stepsCount} خطوة</span>
+              </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <PWAInstallButton />
-              <Button variant="outline" size="md" onClick={onTriggerTestAlarm}>
+              <Button variant="outline" size="sm" onClick={onTriggerTestAlarm}>
                 <BellRing className="h-4 w-4 text-red-500" strokeWidth={1.75} />
-                <span>تجربة التنبيه الصارم الآن</span>
+                <span>تجربة المنبه</span>
               </Button>
             </div>
           </div>
         </div>
       </Surface>
 
-      {/* Section 1: Direct Native Fetch Gemini API (BYOK + Editable Model ID) */}
+      {/* Section 1: Standard Permissions Wizard (Instant Android "Allow / سماح" Dialogs) */}
       <Surface className="space-y-4 p-5">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#E2E8F0] pb-3 dark:border-[#232936]">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#E5E7EB] pb-3 dark:border-[#222630]">
           <div className="flex items-center gap-2">
-            <KeyRound className="h-4 w-4 text-blue-500" strokeWidth={1.75} />
-            <h2 className="text-base font-semibold">
-              اتصال Gemini API المباشر (Client-Side Fetch)
-            </h2>
+            <Smartphone className="h-4 w-4 text-blue-500" strokeWidth={1.75} />
+            <h2 className="text-sm font-semibold">الأذونات (المنبه والميكروفون)</h2>
           </div>
-          <span className="font-mono-tabular text-xs text-[#64748B] dark:text-[#94A3B8]">
-            {settings.geminiModelId ?? DEFAULT_GEMINI_MODEL_ID} ·{' '}
-            {settings.apiKeyLastFour
-              ? `مفتاح محفوظ (****${settings.apiKeyLastFour})`
-              : 'يعمل بالمحرك المحلي الاحتياطي'}
+          <span className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+            {isNativeApk ? 'Android APK' : 'PWA / متصفح'}
           </span>
         </div>
 
-        <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" strokeWidth={1.75} />
-          <p>
-            <strong>ملاحظة أمنية:</strong> يتصل التطبيق مباشرة عبر Fetch بالرابط الرسمي لـ Google
-            Gemini دون أي خادم وسيط ليعمل على GitHub Pages و APK. يُشفّر المفتاح محلياً بـ AES-GCM
-            في IndexedDB، ويُنصح بتقييده في Google Cloud Console على Gemini API فقط.
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          {/* Alarm & Local Notifications */}
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-[#E5E7EB] bg-[#FAFAFA] p-4 dark:border-[#222630] dark:bg-[#0E1015]">
+            <div className="flex items-start gap-2.5">
+              <BellRing className="mt-0.5 h-4 w-4 shrink-0 text-blue-500" strokeWidth={1.75} />
+              <div className="space-y-0.5">
+                <p className="text-sm font-medium">إشعارات المنبه</p>
+                <p className="font-mono-tabular text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
+                  POST_NOTIFICATIONS
+                </p>
+              </div>
+            </div>
+            <Button
+              variant={notifGranted ? 'secondary' : 'primary'}
+              size="sm"
+              onClick={() => void handleRequestAlarmPermission()}
+            >
+              {notifGranted ? (
+                <>
+                  <Check className="h-3.5 w-3.5 text-emerald-500" strokeWidth={1.75} />
+                  <span>مفعّل</span>
+                </>
+              ) : (
+                <span>طلب السماح</span>
+              )}
+            </Button>
+          </div>
+
+          {/* Microphone & Speech Recognition */}
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-[#E5E7EB] bg-[#FAFAFA] p-4 dark:border-[#222630] dark:bg-[#0E1015]">
+            <div className="flex items-start gap-2.5">
+              <Mic className="mt-0.5 h-4 w-4 shrink-0 text-blue-500" strokeWidth={1.75} />
+              <div className="space-y-0.5">
+                <p className="text-sm font-medium">الميكروفون والصوت</p>
+                <p className="font-mono-tabular text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
+                  RECORD_AUDIO
+                </p>
+              </div>
+            </div>
+            <Button
+              variant={micGranted ? 'secondary' : 'primary'}
+              size="sm"
+              onClick={() => void handleRequestMicPermission()}
+            >
+              {micGranted ? (
+                <>
+                  <Check className="h-3.5 w-3.5 text-emerald-500" strokeWidth={1.75} />
+                  <span>مفعّل</span>
+                </>
+              ) : (
+                <span>طلب السماح</span>
+              )}
+            </Button>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" size="sm" onClick={() => void handleFireTestNotification()}>
+            <BellRing className="h-3.5 w-3.5" strokeWidth={1.75} />
+            <span>إشعار اختبار فوري</span>
+          </Button>
+        </div>
+
+        {permissionError && (
+          <ErrorActionBanner
+            message={permissionError.message}
+            fixLabel="تطبيق الإصلاح"
+            onApplyFix={permissionError.onFix}
+            onIgnore={() => setPermissionError(null)}
+          />
+        )}
+
+        {permissionSuccessMsg && !permissionError && (
+          <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
+            {permissionSuccessMsg}
           </p>
+        )}
+      </Surface>
+
+      {/* Section 2: Direct Gemini API (BYOK + Editable Model ID) */}
+      <Surface className="space-y-4 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#E5E7EB] pb-3 dark:border-[#222630]">
+          <div className="flex items-center gap-2">
+            <KeyRound className="h-4 w-4 text-blue-500" strokeWidth={1.75} />
+            <h2 className="text-sm font-semibold">Gemini API</h2>
+          </div>
+          <span className="font-mono-tabular text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+            {settings.geminiModelId ?? DEFAULT_GEMINI_MODEL_ID} ·{' '}
+            {settings.apiKeyLastFour ? `****${settings.apiKeyLastFour}` : 'محلي'}
+          </span>
         </div>
 
         <form onSubmit={handleSaveGeminiConfig} className="space-y-3">
           <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
             <div className="md:col-span-7">
-              <label className="mb-1.5 block text-xs font-medium text-[#64748B] dark:text-[#94A3B8]">
-                مفتاح Gemini API الشخصي (BYOK)
+              <label className="mb-1.5 block text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                مفتاح API (مشفّر محلياً بـ AES-GCM)
               </label>
               <div className="relative">
                 <Input
@@ -485,8 +615,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   onChange={(e) => setApiKeyDraft(e.target.value)}
                   placeholder={
                     settings.apiKeyLastFour
-                      ? `مفتاح محفوظ (****${settings.apiKeyLastFour}) — اتركه فارغاً للإبقاء عليه`
-                      : 'أدخل مفتاح Gemini API (AIza...)...'
+                      ? `محفوظ (****${settings.apiKeyLastFour})`
+                      : 'AIza...'
                   }
                   className="font-mono-tabular pl-12"
                   dir="ltr"
@@ -495,7 +625,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   type="button"
                   onClick={() => setShowKey((prev) => !prev)}
                   aria-label={showKey ? 'إخفاء المفتاح' : 'إظهار المفتاح'}
-                  className="absolute left-2 top-1/2 flex h-8 w-8 -translate-y-1/2 cursor-pointer items-center justify-center rounded-lg text-[#64748B] hover:bg-[#EEF1F6] dark:hover:bg-[#1A1F28]"
+                  className="absolute left-2 top-1/2 flex h-8 w-8 -translate-y-1/2 cursor-pointer items-center justify-center rounded-lg text-[#6B7280] hover:bg-[#F3F4F6] dark:hover:bg-[#1E222D]"
                 >
                   {showKey ? (
                     <EyeOff className="h-4 w-4" strokeWidth={1.75} />
@@ -507,7 +637,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
 
             <div className="md:col-span-5">
-              <label className="mb-1.5 block text-xs font-medium text-[#64748B] dark:text-[#94A3B8]">
+              <label className="mb-1.5 block text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
                 معرّف النموذج (Model ID)
               </label>
               <Input
@@ -522,13 +652,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <Button type="submit" variant="primary">
-              <span>حفظ الإعدادات محلياً</span>
+            <Button type="submit" variant="primary" size="sm">
+              <span>حفظ</span>
             </Button>
             <Button
               type="button"
               variant="secondary"
-              onClick={handleTestApiKey}
+              size="sm"
+              onClick={() => void handleTestApiKey()}
               disabled={isTestingKey}
             >
               {isTestingKey ? (
@@ -536,43 +667,52 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               ) : (
                 <ShieldCheck className="h-4 w-4" strokeWidth={1.75} />
               )}
-              <span>اختبار الاتصال المباشر</span>
+              <span>اختبار الاتصال</span>
             </Button>
             {settings.encryptedApiKey && (
-              <Button type="button" variant="ghost" onClick={handleClearApiKey}>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => void handleClearApiKey()}
+              >
                 <Trash2 className="h-4 w-4 text-red-500" strokeWidth={1.75} />
-                <span className="text-red-500">مسح المفتاح</span>
+                <span className="text-red-500">مسح</span>
               </Button>
             )}
           </div>
         </form>
 
-        {keyStatusMsg && (
-          <p
-            className={`break-words text-xs font-medium leading-relaxed ${
-              keyStatusMsg.ok
-                ? 'text-emerald-600 dark:text-emerald-400'
-                : 'text-red-600 dark:text-red-400'
-            }`}
-          >
-            {keyStatusMsg.text}
+        {keyErrorMsg && (
+          <ErrorActionBanner
+            message={keyErrorMsg}
+            fixLabel="تطبيق الإصلاح"
+            onApplyFix={() => {
+              setModelIdDraft(DEFAULT_GEMINI_MODEL_ID);
+              setKeyErrorMsg(null);
+            }}
+            onIgnore={() => setKeyErrorMsg(null)}
+          />
+        )}
+
+        {keySuccessMsg && !keyErrorMsg && (
+          <p className="break-words text-xs font-medium text-emerald-600 dark:text-emerald-400">
+            {keySuccessMsg}
           </p>
         )}
       </Surface>
 
-      {/* Section 2: Real Bi-Directional Supabase Cloud Sync & Auth */}
+      {/* Section 3: Supabase Cloud Sync & Auth */}
       <Surface className="space-y-4 p-5">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#E2E8F0] pb-3 dark:border-[#232936]">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#E5E7EB] pb-3 dark:border-[#222630]">
           <div className="flex items-center gap-2">
             <Cloud className="h-4 w-4 text-blue-500" strokeWidth={1.75} />
-            <h2 className="text-base font-semibold">
-              المزامنة السحابية بين الكمبيوتر والهاتف (Supabase)
-            </h2>
+            <h2 className="text-sm font-semibold">المزامنة السحابية (Supabase)</h2>
           </div>
-          <span className="font-mono-tabular text-xs text-[#64748B] dark:text-[#94A3B8]">
-            {pendingSyncCount} تغييرات معلقة
+          <span className="font-mono-tabular text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+            {pendingSyncCount} معلق
             {settings.lastSyncedAt
-              ? ` · آخر مزامنة ${new Date(settings.lastSyncedAt).toLocaleTimeString('ar-SA', {
+              ? ` · ${new Date(settings.lastSyncedAt).toLocaleTimeString('ar-SA', {
                   hour: '2-digit',
                   minute: '2-digit',
                 })}`
@@ -585,7 +725,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <Input
               value={supabaseUrl}
               onChange={(e) => setSupabaseUrl(e.target.value)}
-              placeholder="Supabase Project URL (https://xxx.supabase.co)"
+              placeholder="Project URL (https://xxx.supabase.co)"
               dir="ltr"
               className="font-mono-tabular text-xs"
             />
@@ -595,30 +735,34 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               type="password"
               value={supabaseAnonKey}
               onChange={(e) => setSupabaseAnonKey(e.target.value)}
-              placeholder="Supabase Public Anon Key"
+              placeholder="Public Anon Key"
               dir="ltr"
               className="font-mono-tabular text-xs"
             />
           </div>
           <div className="md:col-span-2">
             <Button type="submit" variant="secondary" className="w-full">
-              حفظ الربط
+              حفظ
             </Button>
           </div>
         </form>
 
-        {/* Auth & Sync Controls shown after Project URL + Anon Key are saved */}
         {hasSavedSupabase && (
-          <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 dark:border-[#232936] dark:bg-[#0E1116]">
+          <div className="rounded-xl border border-[#E5E7EB] bg-[#FAFAFA] p-4 dark:border-[#222630] dark:bg-[#0E1015]">
             {loggedInEmail ? (
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="space-y-0.5">
-                  <p className="text-xs text-[#64748B] dark:text-[#94A3B8]">الحساب المتصل بالمزامنة</p>
+                  <p className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">الحساب المتصل</p>
                   <p className="font-mono-tabular text-sm font-semibold">{loggedInEmail}</p>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  <Button variant="primary" onClick={handleSyncNow} disabled={isSyncing}>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => void handleSyncNow()}
+                    disabled={isSyncing}
+                  >
                     {isSyncing ? (
                       <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.75} />
                     ) : (
@@ -628,20 +772,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </Button>
                   <Button
                     variant="outline"
-                    size="md"
-                    onClick={handleSupabaseLogout}
+                    size="sm"
+                    onClick={() => void handleSupabaseLogout()}
                     disabled={isAuthBusy}
                   >
                     <LogOut className="h-4 w-4" strokeWidth={1.75} />
-                    <span>تسجيل الخروج</span>
+                    <span>خروج</span>
                   </Button>
                 </div>
               </div>
             ) : (
               <form onSubmit={handleSupabaseLogin} className="space-y-3">
-                <p className="text-xs font-medium text-[#475569] dark:text-[#CBD5E1]">
-                  سجّل الدخول أو أنشئ حساباً لبدء المزامنة الثنائية مع جداول Supabase الخاصة بك:
-                </p>
                 <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
                   <Input
                     type="email"
@@ -655,13 +796,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     type="password"
                     value={authPassword}
                     onChange={(e) => setAuthPassword(e.target.value)}
-                    placeholder="كلمة المرور (6 أحرف فأكثر)"
+                    placeholder="كلمة المرور"
                     dir="ltr"
                     required
                   />
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  <Button type="submit" variant="primary" disabled={isAuthBusy}>
+                  <Button type="submit" variant="primary" size="sm" disabled={isAuthBusy}>
                     {isAuthBusy ? (
                       <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.75} />
                     ) : (
@@ -672,7 +813,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <Button
                     type="button"
                     variant="outline"
-                    onClick={handleSupabaseSignUp}
+                    size="sm"
+                    onClick={() => void handleSupabaseSignUp()}
                     disabled={isAuthBusy}
                   >
                     <UserPlus className="h-4 w-4" strokeWidth={1.75} />
@@ -684,68 +826,71 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         )}
 
-        {syncNotice && (
-          <p
-            className={`text-xs font-medium ${
-              syncNotice.ok
-                ? 'text-emerald-600 dark:text-emerald-400'
-                : 'text-red-600 dark:text-red-400'
-            }`}
-          >
-            {syncNotice.text}
+        {syncErrorMsg && (
+          <ErrorActionBanner
+            message={syncErrorMsg}
+            fixLabel="تطبيق الإصلاح"
+            onApplyFix={() => {
+              setSyncErrorMsg(null);
+              if (loggedInEmail) {
+                void handleSyncNow();
+              }
+            }}
+            onIgnore={() => setSyncErrorMsg(null)}
+          />
+        )}
+
+        {syncSuccessMsg && !syncErrorMsg && (
+          <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
+            {syncSuccessMsg}
           </p>
         )}
       </Surface>
 
-      {/* Section 3: Appearance, Alarm Strictness & Local Backup */}
+      {/* Section 4: Appearance, Alarm & Local Backup */}
       <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
         <Surface className="space-y-4 p-5">
-          <h2 className="border-b border-[#E2E8F0] pb-3 text-base font-semibold dark:border-[#232936]">
-            المظهر والنسخ الاحتياطي المحلي (IndexedDB)
+          <h2 className="border-b border-[#E5E7EB] pb-3 text-sm font-semibold dark:border-[#222630]">
+            المظهر والنسخ الاحتياطي
           </h2>
 
-          <div className="space-y-2">
-            <span className="block text-xs font-medium text-[#64748B] dark:text-[#94A3B8]">
-              سمة الواجهة
-            </span>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => void handleThemeSwitch('dark')}
-                className={`flex min-h-[44px] cursor-pointer items-center justify-center gap-2 rounded-xl border text-xs font-medium transition-colors ${
-                  settings.themeMode === 'dark'
-                    ? 'border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400'
-                    : 'border-[#E2E8F0] text-[#64748B] dark:border-[#232936]'
-                }`}
-              >
-                <Moon className="h-4 w-4" strokeWidth={1.75} />
-                <span>داكن (Linear)</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleThemeSwitch('light')}
-                className={`flex min-h-[44px] cursor-pointer items-center justify-center gap-2 rounded-xl border text-xs font-medium transition-colors ${
-                  settings.themeMode === 'light'
-                    ? 'border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400'
-                    : 'border-[#E2E8F0] text-[#64748B] dark:border-[#232936]'
-                }`}
-              >
-                <Sun className="h-4 w-4" strokeWidth={1.75} />
-                <span>فاتح (One UI)</span>
-              </button>
-            </div>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => void handleThemeSwitch('dark')}
+              className={`flex min-h-[42px] cursor-pointer items-center justify-center gap-2 rounded-xl border text-xs font-medium transition-colors ${
+                settings.themeMode === 'dark'
+                  ? 'border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400'
+                  : 'border-[#E5E7EB] text-[#6B7280] dark:border-[#222630]'
+              }`}
+            >
+              <Moon className="h-4 w-4" strokeWidth={1.75} />
+              <span>داكن</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleThemeSwitch('light')}
+              className={`flex min-h-[42px] cursor-pointer items-center justify-center gap-2 rounded-xl border text-xs font-medium transition-colors ${
+                settings.themeMode === 'light'
+                  ? 'border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400'
+                  : 'border-[#E5E7EB] text-[#6B7280] dark:border-[#222630]'
+              }`}
+            >
+              <Sun className="h-4 w-4" strokeWidth={1.75} />
+              <span>فاتح</span>
+            </button>
           </div>
 
-          <div className="space-y-2 border-t border-[#E2E8F0] pt-4 dark:border-[#232936]">
+          <div className="space-y-2.5 border-t border-[#E5E7EB] pt-4 dark:border-[#222630]">
             <div className="flex items-center justify-between text-xs">
               <span className="flex items-center gap-1.5 font-medium">
                 <Database className="h-3.5 w-3.5 text-blue-500" strokeWidth={1.75} />
-                قاعدة البيانات المحلية Dexie.js
+                IndexedDB
               </span>
-              <span className="font-mono-tabular text-[#64748B]">{stepsCount} خطوات محلية</span>
+              <span className="font-mono-tabular text-[#6B7280]">{stepsCount} خطوة</span>
             </div>
-            <div className="flex flex-wrap gap-2 pt-1">
-              <Button variant="secondary" size="sm" onClick={handleExportJson}>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="secondary" size="sm" onClick={() => void handleExportJson()}>
                 <Download className="h-3.5 w-3.5" strokeWidth={1.75} />
                 <span>تصدير JSON</span>
               </Button>
@@ -761,23 +906,34 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <span>استيراد JSON</span>
               </Button>
             </div>
-            {backupNotice && (
-              <p className="text-xs text-blue-600 dark:text-blue-400">{backupNotice}</p>
+            {backupErrorMsg && (
+              <ErrorActionBanner
+                message={backupErrorMsg}
+                fixLabel="تطبيق الإصلاح"
+                onApplyFix={() => {
+                  setBackupErrorMsg(null);
+                  importFileRef.current?.click();
+                }}
+                onIgnore={() => setBackupErrorMsg(null)}
+              />
+            )}
+            {backupSuccessMsg && !backupErrorMsg && (
+              <p className="text-xs text-emerald-600 dark:text-emerald-400">{backupSuccessMsg}</p>
             )}
           </div>
         </Surface>
 
-        {/* Alarm Strictness Settings */}
+        {/* Alarm Settings */}
         <Surface className="space-y-4 p-5">
-          <h2 className="border-b border-[#E2E8F0] pb-3 text-base font-semibold dark:border-[#232936]">
-            إعدادات المنبه الصارم وحماية البطارية
+          <h2 className="border-b border-[#E5E7EB] pb-3 text-sm font-semibold dark:border-[#222630]">
+            المنبه الصارم
           </h2>
 
           <div className="space-y-2">
             <div className="flex items-center justify-between text-xs">
-              <span>مدة نافذة المراقبة عند رنين المنبه</span>
+              <span className="text-[#6B7280] dark:text-[#9CA3AF]">نافذة المراقبة</span>
               <span className="font-mono-tabular font-semibold">
-                {settings.strictMonitoringMinutes} دقيقة
+                {settings.strictMonitoringMinutes} د
               </span>
             </div>
             <div className="grid grid-cols-3 gap-2">
@@ -786,28 +942,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   key={mins}
                   type="button"
                   onClick={() => void handleUpdateAlarmSettings({ strictMonitoringMinutes: mins })}
-                  className={`min-h-[40px] cursor-pointer rounded-xl border font-mono-tabular text-xs font-medium ${
+                  className={`min-h-[38px] cursor-pointer rounded-xl border font-mono-tabular text-xs font-medium ${
                     settings.strictMonitoringMinutes === mins
                       ? 'border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400'
-                      : 'border-[#E2E8F0] text-[#64748B] dark:border-[#232936]'
+                      : 'border-[#E5E7EB] text-[#6B7280] dark:border-[#222630]'
                   }`}
                 >
-                  {mins} دقيقة
+                  {mins} د
                 </button>
               ))}
             </div>
           </div>
 
           <div className="space-y-2">
-            <span className="block text-xs">تحدي زر الطوارئ المحمي (التأجيل لمرة واحدة)</span>
+            <span className="block text-xs text-[#6B7280] dark:text-[#9CA3AF]">تحدي الطوارئ</span>
             <div className="grid grid-cols-2 gap-2">
               <button
                 type="button"
                 onClick={() => void handleUpdateAlarmSettings({ emergencyChallengeType: 'math' })}
-                className={`min-h-[40px] cursor-pointer rounded-xl border text-xs font-medium ${
+                className={`min-h-[38px] cursor-pointer rounded-xl border text-xs font-medium ${
                   settings.emergencyChallengeType === 'math'
                     ? 'border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400'
-                    : 'border-[#E2E8F0] text-[#64748B] dark:border-[#232936]'
+                    : 'border-[#E5E7EB] text-[#6B7280] dark:border-[#222630]'
                 }`}
               >
                 معادلة رياضية
@@ -817,20 +973,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 onClick={() =>
                   void handleUpdateAlarmSettings({ emergencyChallengeType: 'sentence' })
                 }
-                className={`min-h-[40px] cursor-pointer rounded-xl border text-xs font-medium ${
+                className={`min-h-[38px] cursor-pointer rounded-xl border text-xs font-medium ${
                   settings.emergencyChallengeType === 'sentence'
                     ? 'border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400'
-                    : 'border-[#E2E8F0] text-[#64748B] dark:border-[#232936]'
+                    : 'border-[#E5E7EB] text-[#6B7280] dark:border-[#222630]'
                 }`}
               >
-                جملة تأكيد طويلة
+                جملة تأكيد
               </button>
             </div>
           </div>
 
           <div className="space-y-1.5">
             <div className="flex items-center justify-between text-xs">
-              <span>شدة صوت المنبه المستمر</span>
+              <span className="text-[#6B7280] dark:text-[#9CA3AF]">مستوى الصوت</span>
               <span className="font-mono-tabular">{Math.round(settings.alarmVolume * 100)}%</span>
             </div>
             <input
@@ -848,115 +1004,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </Surface>
       </div>
 
-      {/* Section 4: Android CapacitorJS Permission Wizard with real Capacitor.isNativePlatform() check */}
-      <Surface className="space-y-4 p-5">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#E2E8F0] pb-3 dark:border-[#232936]">
-          <div className="flex items-center gap-2">
-            <Smartphone className="h-4 w-4 text-blue-500" strokeWidth={1.75} />
-            <h2 className="text-base font-semibold">معالج صلاحيات الأندرويد (CapacitorJS APK)</h2>
-          </div>
-          <span className="text-xs text-[#64748B] dark:text-[#94A3B8]">
-            {isNativeApk
-              ? 'تم اكتشاف بيئة الأندرويد الأصلية'
-              : 'متاح على نسخة APK فقط — تعمل مراقبة التبويب على الويب تلقائياً'}
-          </span>
-        </div>
-
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          <div className="flex items-center justify-between gap-3 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 dark:border-[#232936] dark:bg-[#0E1116]">
-            <div className="space-y-1">
-              <p className="text-sm font-semibold">1. الظهور فوق التطبيقات</p>
-              <p className="font-mono-tabular text-[11px] text-[#64748B]">SYSTEM_ALERT_WINDOW</p>
-            </div>
-            {!isNativeApk ? (
-              <span className="shrink-0 text-xs font-medium text-[#64748B] dark:text-[#94A3B8]">
-                متاح على نسخة APK فقط
-              </span>
-            ) : (
-              <Button
-                variant={settings.androidOverlayGranted ? 'secondary' : 'primary'}
-                size="sm"
-                onClick={handleRequestOverlay}
-              >
-                {settings.androidOverlayGranted ? (
-                  <>
-                    <Check className="h-3.5 w-3.5 text-emerald-500" strokeWidth={1.75} />
-                    <span>مهيأة</span>
-                  </>
-                ) : (
-                  <span>تفعيل الآن</span>
-                )}
-              </Button>
-            )}
-          </div>
-
-          <div className="flex items-center justify-between gap-3 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 dark:border-[#232936] dark:bg-[#0E1116]">
-            <div className="space-y-1">
-              <p className="text-sm font-semibold">2. الوصول لبيانات الاستخدام</p>
-              <p className="font-mono-tabular text-[11px] text-[#64748B]">
-                PACKAGE_USAGE_STATS
-              </p>
-            </div>
-            {!isNativeApk ? (
-              <span className="shrink-0 text-xs font-medium text-[#64748B] dark:text-[#94A3B8]">
-                متاح على نسخة APK فقط
-              </span>
-            ) : (
-              <Button
-                variant={settings.androidUsageStatsGranted ? 'secondary' : 'primary'}
-                size="sm"
-                onClick={handleRequestUsageStats}
-              >
-                {settings.androidUsageStatsGranted ? (
-                  <>
-                    <Check className="h-3.5 w-3.5 text-emerald-500" strokeWidth={1.75} />
-                    <span>مهيأة</span>
-                  </>
-                ) : (
-                  <span>تفعيل الآن</span>
-                )}
-              </Button>
-            )}
-          </div>
-        </div>
-
-        {permissionNotice && (
-          <p className="text-xs text-blue-600 dark:text-blue-400">{permissionNotice}</p>
-        )}
-      </Surface>
-
-      {/* Section 5: Collapsed-by-default Developer Tools Accordion */}
+      {/* Section 5: Collapsed Developer Tools Accordion */}
       <Surface className="overflow-hidden">
         <button
           type="button"
           onClick={() => setDevToolsOpen((prev) => !prev)}
           aria-expanded={devToolsOpen}
-          className="flex min-h-[56px] w-full cursor-pointer items-center justify-between gap-4 px-5 py-4 text-right transition-colors hover:bg-[#F8FAFC] dark:hover:bg-[#171B23]"
+          className="flex min-h-[52px] w-full cursor-pointer items-center justify-between gap-4 px-5 py-3.5 text-right transition-colors hover:bg-[#FAFAFA] dark:hover:bg-[#171A22]"
         >
           <div className="flex items-center gap-2.5">
-            <Code2 className="h-4 w-4 text-[#64748B] dark:text-[#94A3B8]" strokeWidth={1.75} />
-            <div>
-              <span className="block text-sm font-semibold">أدوات المطور (متقدم)</span>
-              <span className="block text-xs text-[#64748B] dark:text-[#94A3B8]">
-                مخطط Supabase SQL + RLS الكامل وتصاريح AndroidManifest.xml
-              </span>
-            </div>
+            <Code2 className="h-4 w-4 text-[#6B7280] dark:text-[#9CA3AF]" strokeWidth={1.75} />
+            <span className="text-sm font-semibold">أدوات المطور (متقدم)</span>
           </div>
           {devToolsOpen ? (
-            <ChevronUp className="h-4 w-4 shrink-0 text-[#64748B]" strokeWidth={1.75} />
+            <ChevronUp className="h-4 w-4 shrink-0 text-[#6B7280]" strokeWidth={1.75} />
           ) : (
-            <ChevronDown className="h-4 w-4 shrink-0 text-[#64748B]" strokeWidth={1.75} />
+            <ChevronDown className="h-4 w-4 shrink-0 text-[#6B7280]" strokeWidth={1.75} />
           )}
         </button>
 
         {devToolsOpen && (
-          <div className="space-y-6 border-t border-[#E2E8F0] p-5 dark:border-[#232936]">
-            {/* Supabase SQL Schema */}
+          <div className="space-y-6 border-t border-[#E5E7EB] p-5 dark:border-[#222630]">
             <div className="space-y-2.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-xs font-semibold">
-                  مخطط قاعدة البيانات السحابية (Supabase PostgreSQL + RLS)
-                </span>
+                <span className="text-xs font-semibold">Supabase SQL + RLS</span>
                 <div className="flex items-center gap-2">
                   <Button
                     variant="outline"
@@ -982,24 +1053,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     }
                   >
                     <Download className="h-3.5 w-3.5" strokeWidth={1.75} />
-                    <span>تنزيل schema.sql</span>
+                    <span>تنزيل</span>
                   </Button>
                 </div>
               </div>
               <pre
                 dir="ltr"
-                className="font-mono-tabular max-h-80 overflow-auto rounded-xl border border-[#E2E8F0] bg-[#0B0D10] p-4 text-[11px] leading-relaxed text-[#CBD5E1] dark:border-[#232936]"
+                className="font-code max-h-72 overflow-auto rounded-xl border border-[#E5E7EB] bg-[#0C0D10] p-4 text-[11px] leading-relaxed text-[#CBD5E1] dark:border-[#222630]"
               >
                 {SUPABASE_SCHEMA_SQL}
               </pre>
             </div>
 
-            {/* Android Manifest Permissions */}
-            <div className="space-y-2.5 border-t border-[#E2E8F0] pt-5 dark:border-[#232936]">
+            <div className="space-y-2.5 border-t border-[#E5E7EB] pt-5 dark:border-[#222630]">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold">
-                  تصاريح AndroidManifest.xml الجاهزة لحزمة APK
-                </span>
+                <span className="text-xs font-semibold">AndroidManifest.xml</span>
                 <Button
                   variant="outline"
                   size="sm"
@@ -1010,12 +1078,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   ) : (
                     <Copy className="h-3.5 w-3.5" strokeWidth={1.75} />
                   )}
-                  <span>{copiedTarget === 'manifest' ? 'تم النسخ' : 'نسخ التصاريح'}</span>
+                  <span>{copiedTarget === 'manifest' ? 'تم النسخ' : 'نسخ'}</span>
                 </Button>
               </div>
               <pre
                 dir="ltr"
-                className="font-mono-tabular overflow-x-auto rounded-xl border border-[#E2E8F0] bg-[#0B0D10] p-3.5 text-[11px] leading-relaxed text-[#CBD5E1] dark:border-[#232936]"
+                className="font-code overflow-x-auto rounded-xl border border-[#E5E7EB] bg-[#0C0D10] p-3.5 text-[11px] leading-relaxed text-[#CBD5E1] dark:border-[#222630]"
               >
                 {ANDROID_MANIFEST_SNIPPET}
               </pre>

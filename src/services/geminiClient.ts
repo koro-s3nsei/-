@@ -7,7 +7,6 @@ import type {
   ProjectDecompositionResult,
 } from '../types/models';
 import {
-  buildOfflineBlueprintSvg,
   parseScheduleTextOffline,
   runOfflineProjectDecomposition,
   runOfflineStrictIngestion,
@@ -455,30 +454,5 @@ export async function parseScheduleCommitments(ocrText: string): Promise<{
     return { items, engine: creds.modelId };
   } catch {
     return { items: parseScheduleTextOffline(ocrText), engine: 'offline-local' };
-  }
-}
-
-export async function generateProjectBlueprintSvg(
-  projectTitle: string,
-  taskTitles: string[]
-): Promise<string> {
-  const creds = await getActiveCredentials();
-  if (!creds) {
-    return buildOfflineBlueprintSvg(projectTitle, taskTitles);
-  }
-
-  try {
-    const rawSvg = await callGeminiDirectFetch(creds.apiKey, creds.modelId, {
-      prompt: `أنشئ كود SVG معماري نظيف (viewBox="0 0 640 240") يوضح مخطط تدفق المشروع "${projectTitle}" ومراحله: ${taskTitles.join(' -> ')}. استخدم خلفية #0F131A وشبكة هندسية دقيقة #1E2634 وألوان #3B82F6 و #F3F5F8. أعد عنصر <svg> صالح فقط دون علامات markdown.`,
-      systemInstruction:
-        'أعد كود SVG خام ونظيف يبدأ بـ <svg وينتهي بـ </svg> بدون أي نص قبله أو بعده وبدون scripts.',
-    });
-    const match = rawSvg.match(/<svg[\s\S]*<\/svg>/i);
-    if (match && !/<script/i.test(match[0])) {
-      return match[0];
-    }
-    return buildOfflineBlueprintSvg(projectTitle, taskTitles);
-  } catch {
-    return buildOfflineBlueprintSvg(projectTitle, taskTitles);
   }
 }
